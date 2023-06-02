@@ -1,0 +1,415 @@
+#! /usr/bin/env python3
+import os
+import sys
+import time
+import logging
+import pprint
+import argparse
+import textwrap
+import tempfile
+from pathlib import Path
+import subprocess
+import re
+from io import StringIO
+
+import pyarrow as pa
+import pyarrow.compute as pc
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
+import pyarrow.csv
+import dateutil.parser
+import datetime
+
+program_name = os.path.basename(__file__)
+VERSION = 0.1
+logger = logging.getLogger(__name__)
+
+# Match snort.log.* and *.pcap files
+pattern = "snort\.log.*|.*\.pcap"
+
+
+###############################################################################
+class Pcap2Parquet:
+
+    PCAP_COLUMN_NAMES: dict[str, dict] = {
+        '_ws.col.Time': {'frame_time': pa.timestamp('us')},
+        'ip.src': {'ip_src': pa.string()},
+        'ip.dst': {'ip_dst': pa.string()},
+        'ip.proto': {'ip_proto': pa.uint8()},
+        'tcp.flags.str': {'tcp_flags': pa.string()},
+        '_ws.col.Source': {'col_source': pa.string()},
+        '_ws.col.Destination': {'col_destination': pa.string()},
+        '_ws.col.Protocol': {'col_protocol': pa.string()},
+        'dns.qry.name': {'dns_qry_name': pa.string()},
+        'dns.qry.type': {'dns_qry_type': pa.string()},
+        'eth.type': {'eth_type': pa.uint16()},
+        'frame.len': {'frame_len': pa.uint16()},
+        'udp.length': {'udp_length': pa.uint16()},
+        'http.request.uri': {'http_request_uri': pa.string()},
+        'http.host': {'http_host': pa.string()},
+        'http.request.method': {'http_request_method': pa.string()},
+        'http.user_agent': {'http_user_agent': pa.string()},
+        'icmp.type': {'icmp_type': pa.uint8()},
+        'ip.frag_offset': {'ip_frag_offset': pa.uint16()},
+        'ip.ttl': {'ip_ttl': pa.uint8()},
+        'ntp.priv.reqcode': {'ntp_priv_reqcode': pa.string()},
+        'tcp.dstport': {'tcp_dstport': pa.uint16()},
+        'tcp.srcport': {'tcp_srcport': pa.uint16()},
+        'udp.dstport': {'udp_dstport': pa.uint16()},
+        'udp.srcport': {'udp_srcport': pa.uint16()},
+        '_ws.col.Info': {'col_info': pa.string()},
+    }
+
+    # Max size of chunk to read at a time
+    block_size = 512 * 1024 * 1024
+
+    chunks = None
+
+    # ------------------------------------------------------------------------------
+    def __init__(self, source_file: str, destination_dir: str, log_parse_errors=False):
+        """Initialises Nfdump2Parquet instance.
+
+        Provide nfdump_fields parameter **only** if defaults don't work
+        Defaults for parquet_fields: ts, te, td, sa, da, sp, dp, pr, flg, ipkt, ibyt, opkt, obyt
+
+        :param source_file: name of the nfcapd file to convert
+        :param destination_dir: directory for storing resulting parquet file
+        :param parquet_fields: the fields from ncapd file to translate to parquet
+        :param nfdump_fields: the fields (and order) in the nfcapd file
+        """
+        if not os.path.isfile(source_file):
+            raise FileNotFoundError(source_file)
+        self.src_file = source_file
+        self.basename = os.path.basename(source_file)
+        self.dst_dir = destination_dir
+        if not self.dst_dir.endswith('/'):
+            self.dst_dir = f"{self.dst_dir}/"
+        self.parse_errors = 0
+        self.log_parse_errors = log_parse_errors
+
+    # ------------------------------------------------------------------------------
+    def __prepare_file(self):
+
+        # Chop up a file into multiple chunks if it is bigger than a certain size
+        # Returns either a list of chunk files or the same single file
+        filename = Path(self.src_file)
+        if filename.stat().st_size < (100*1000*1000):  # PCAP is smaller than 100MB
+            self.chunks = [self.src_file]
+        else:
+            logger.debug(f'Splitting PCAP file {filename} into chunks of 100MB.')
+            subprocess.run(['tcpdump', '-r', filename, '-w', '/tmp/pcap2parquet_chunk', '-C', '100'],
+                           capture_output=True)
+            self.chunks = sorted([Path(rootdir) / file for rootdir, _, files in os.walk('/tmp')
+                                  for file in files if file.startswith('pcap2parquet_chunk')])
+
+    # ------------------------------------------------------------------------------
+    def __cleanup(self):
+        if self.chunks:
+            if len(self.chunks) > 1:
+                for chunk in self.chunks:
+                    os.remove(chunk)
+            self.chunks = None
+
+    # ------------------------------------------------------------------------------
+    def __parse_error(self, row):
+        # logger.debug(row.text)
+        self.parse_errors += 1
+        if self.log_parse_errors:
+            # Append to file
+            with open(self.basename+'-parse-errors.txt', 'a', encoding='utf-8') as f:
+                f.write(row.text+'\n')
+        return 'skip'
+
+    # ------------------------------------------------------------------------------
+    def convert(self):
+
+        pp = pprint.PrettyPrinter(indent=4)
+
+        # Create the list of columns tshark has to export to CSV
+        col_extract = list(self.PCAP_COLUMN_NAMES.keys())
+
+        # Create the list of names pyarrow gives to the columns in the CSV
+        col_names = []
+        for extr_name in col_extract:
+            col_names.append(next(iter(self.PCAP_COLUMN_NAMES[extr_name])))
+
+        # Dict mapping column names to the pyarrow types
+        col_type = {}
+        [col_type.update(valtyp) for valtyp in self.PCAP_COLUMN_NAMES.values()]
+
+        start = time.time()
+
+        self.__prepare_file()
+
+        tmp_file, tmp_filename = tempfile.mkstemp()
+        os.close(tmp_file)
+
+        tshark_error = False
+        try:
+            with open(tmp_filename, 'a', encoding='utf-8') as f:
+                new_env = dict(os.environ)
+                new_env['LC_ALL'] = 'C.utf8'
+                new_env['LC_TIME'] = 'POSIX'
+                new_env['LC_NUMERIC'] = 'C.utf8'
+                for chunk in self.chunks:
+
+                    # Create command
+                    command = ['tshark', '-r', str(chunk), '-t', 'ud', '-T', 'fields']
+                    for field in col_extract:
+                        command.extend(['-e', field])
+                    for option in ['header=n', 'separator=/t', 'quote=n', 'occurrence=f']:
+                        command.extend(['-E', option])
+
+                    logger.debug(" ".join(command))
+                    process = subprocess.run(command, stdout=f, stderr=subprocess.PIPE, env=new_env)
+                    output = process.stderr
+                    if process.returncode != 0:
+                        err = output.decode('utf-8')
+                        logger.error(f'tshark command failed:{err}\n')
+                        tshark_error = True
+                    else:
+                        if len(output) > 0:
+                            err = output.decode('utf-8')
+                            for errline in err.split('\n'):
+                                if len(errline) > 0:
+                                    logger.warning(errline)
+
+        except Exception as e:
+            logger.error(f'Error reading {self.src_file} : {e}')
+            pp.pprint(e)
+            self.__cleanup()
+            return
+
+        duration = time.time() - start
+        sf = os.path.basename(self.src_file)
+        logger.debug(f"{sf} to CSV in {duration:.2f}s")
+
+        self.__cleanup()
+
+        # If an error occurred: clean up and return
+        if tshark_error:
+            os.remove(tmp_filename)
+            self.__cleanup()
+            return
+
+        pqwriter = None
+
+        # Now read the produced CSV
+        try:
+            with pyarrow.csv.open_csv(
+                                      input_file=tmp_filename,
+                                      # input_file='tmp.csv',
+                                      read_options=pyarrow.csv.ReadOptions(
+                                          block_size=self.block_size,
+                                          column_names=col_names,
+                                          encoding='utf-8',
+                                      ),
+                                      parse_options=pyarrow.csv.ParseOptions(
+                                          delimiter='\t',
+                                          # quote_char="'",
+                                          invalid_row_handler=self.__parse_error
+                                      ),
+                                      convert_options=pyarrow.csv.ConvertOptions(
+                                          timestamp_parsers=[pyarrow.csv.ISO8601],
+                                          column_types=col_type,
+                                      ),
+                                      ) as reader:
+                chunk_nr = 0
+                for next_chunk in reader:
+                    chunk_nr += 1
+                    if next_chunk is None:
+                        break
+                    table = pa.Table.from_batches([next_chunk])
+                    # Add a column with the basename of the source file
+                    # This will allow detailed investigation of the proper
+                    # original pcap file with tshark if needed
+                    table = table.append_column('pcap_file', pa.array([self.basename] * len(table), pa.string()))
+
+                    if not pqwriter:
+                        pqwriter = pq.ParquetWriter(f'{self.dst_dir}{self.basename}.parquet', table.schema)
+
+                    pqwriter.write_table(table)
+
+        except pyarrow.lib.ArrowInvalid as e:
+            logger.error(e)
+
+        duration = time.time() - start
+        logger.debug(f"CSV to Parquet in {duration:.2f}s")
+
+        os.remove(tmp_filename)
+
+
+###############################################################################
+class ArgumentParser(argparse.ArgumentParser):
+
+    def error(self, message):
+        print('\n\033[1;33mError: {}\x1b[0m\n'.format(message))
+        self.print_help(sys.stderr)
+        # self.exit(2, '%s: error: %s\n' % (self.prog, message))
+        self.exit(2)
+
+
+###############################################################################
+class CustomConsoleFormatter(logging.Formatter):
+    """
+        Log facility format
+    """
+
+    def format(self, record):
+        # info = '\033[0;32m'
+        info = ''
+        warning = '\033[0;33m'
+        error = '\033[1;33m'
+        debug = '\033[1;34m'
+        reset = "\x1b[0m"
+
+        formatter = "%(levelname)s - %(message)s"
+        if record.levelno == logging.INFO:
+            log_fmt = info + formatter + reset
+            self._style._fmt = log_fmt
+        elif record.levelno == logging.WARNING:
+            log_fmt = warning + formatter + reset
+            self._style._fmt = log_fmt
+        elif record.levelno == logging.ERROR:
+            log_fmt = error + formatter + reset
+            self._style._fmt = log_fmt
+        elif record.levelno == logging.DEBUG:
+            # formatter = '%(asctime)s %(levelname)s [%(filename)s.py:%(lineno)s/%(funcName)s] %(message)s'
+            formatter = '%(levelname)s [%(filename)s:%(lineno)s/%(funcName)s] %(message)s'
+            log_fmt = debug + formatter + reset
+            self._style._fmt = log_fmt
+        else:
+            self._style._fmt = formatter
+
+        return super().format(record)
+
+
+###############################################################################
+# Subroutines
+def get_logger(args):
+    logger = logging.getLogger(__name__)
+
+    # Create handlers
+    console_handler = logging.StreamHandler()
+    #    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    formatter = CustomConsoleFormatter()
+    console_handler.setFormatter(formatter)
+
+    logger.setLevel(logging.INFO)
+
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
+
+    # add handlers to the logger
+    logger.addHandler(console_handler)
+
+    return logger
+
+
+# ------------------------------------------------------------------------------
+def parser_add_arguments():
+    """
+        Parse command line parameters
+    """
+    parser = ArgumentParser(
+        prog=program_name,
+        description=textwrap.dedent('''\
+                        Convert pcap file(s) (produced by tshark, tcpdump, snort or others) to parquet format
+                        '''),
+        formatter_class=argparse.RawTextHelpFormatter, )
+
+    parser.add_argument("source",
+                        help=textwrap.dedent('''\
+                        Source pcap file or directory containing pcap files
+                        '''),
+                        action="store",
+                        )
+
+    parser.add_argument("parquetdir",
+                        help=textwrap.dedent('''\
+                        Directory where to store resulting parquet files
+                        '''),
+                        action="store",
+                        )
+
+    parser.add_argument("-l", "--log_parse_errors",
+                        help=textwrap.dedent('''\
+                        Any lines that cannot be parsed will be stored in a file
+                        The filename is equal to the file being processed, 
+                        with '-parse-errors.txt' appended. It will be stored
+                        in the current working directory
+                        '''),
+                        action="store_true",
+                        )
+
+    parser.add_argument("-r", "--recursive",
+                        help="recursively searches for pcap files if source specifies a directory.",
+                        action="store_true")
+
+    parser.add_argument("--debug",
+                        help="show debug output",
+                        action="store_true")
+
+    parser.add_argument("-V", "--version",
+                        help="print version and exit",
+                        action="version",
+                        version='%(prog)s (version {})'.format(VERSION))
+
+    return parser
+
+
+# ------------------------------------------------------------------------------
+def list_files(directory, recursive=False):
+    filelist = []
+    if not os.path.isdir(directory):
+        return filelist
+
+    if not directory.endswith("/"):
+        directory = directory + '/'
+    with os.scandir(directory) as it:
+        for entry in it:
+            if not entry.name.startswith('.'):
+                if entry.is_file():
+                    if re.match(pattern, entry.name):
+                        filelist.append('{0}{1}'.format(directory, entry.name))
+                elif recursive:
+                    filelist.extend(list_files(directory + entry.name, recursive))
+
+    return filelist
+
+
+###############################################################################
+def main():
+    pp = pprint.PrettyPrinter(indent=4)
+    parser = parser_add_arguments()
+    args = parser.parse_args()
+
+    logger = get_logger(args)
+
+    filelist = []
+    filename = args.source
+
+    if os.path.isdir(filename):
+        filelist = list_files(filename, args.recursive)
+    else:
+        filelist.append(filename)
+
+    filelist = sorted(filelist)
+    # pp.pprint(filelist)
+
+    for filename in filelist:
+        logger.info(f'converting {filename}')
+        try:
+            pcap2pqt = Pcap2Parquet(filename, args.parquetdir, args.log_parse_errors)
+            pcap2pqt.convert()
+            if pcap2pqt.parse_errors > 0:
+                logger.info(f'{pcap2pqt.parse_errors} parse errors during conversion, these lines were skipped')
+        except FileNotFoundError as fnf:
+            logger.error(f'File not found: {fnf}')
+            exit(2)
+
+
+###############################################################################
+if __name__ == '__main__':
+    # Run the main process
+    main()
