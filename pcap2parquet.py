@@ -1,6 +1,8 @@
 #! /usr/bin/env python3
 import os
+import io
 import sys
+import shutil
 import time
 import logging
 import pprint
@@ -9,8 +11,11 @@ import textwrap
 import tempfile
 from pathlib import Path
 import subprocess
+import multiprocessing
 import re
 from io import StringIO
+import random
+import string
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -26,6 +31,34 @@ logger = logging.getLogger(__name__)
 
 # Match snort.log.* and *.pcap files
 pattern = "snort\.log.*|.*\.pcap"
+
+
+###############################################################################
+# taken from https://stackoverflow.com/questions/69156181/pyarrow-find-bad-lines-in-csv-to-parquet-conversion
+# Since some pcap->csv may have UTF-8 errors
+class UnicodeErrorIgnorerIO(io.IOBase):
+    """Simple wrapper for a BytesIO that removes non-UTF8 input.
+
+    If a file contains non-UTF8 input, it causes problems in pyarrow and other libraries
+    that try to decode the input to unicode strings. This just removes the offending bytes.
+
+    >>> io = io.BytesIO(b"INT\xbfL LICENSING INDUSTRY MERCH ASSOC")
+    >>> io = UnicodeErrorIgnorerIO(io)
+    >>> io.read()
+    'INTL LICENSING INDUSTRY MERCH ASSOC'
+    """
+
+    def __init__(self, file: io.BytesIO) -> None:
+        self.file = file
+
+    def read(self, n=-1):
+        return self.file.read(n).decode("utf-8", "ignore").encode("utf-8")
+
+    def readline(self, n=-1):
+        return self.file.readline(n).decode("utf-8", "ignore").encode("utf-8")
+
+    def readable(self):
+        return True
 
 
 ###############################################################################
@@ -64,9 +97,10 @@ class Pcap2Parquet:
     block_size = 512 * 1024 * 1024
 
     chunks = None
+    chunks_csv = None
 
     # ------------------------------------------------------------------------------
-    def __init__(self, source_file: str, destination_dir: str, log_parse_errors=False):
+    def __init__(self, source_file: str, destination_dir: str, log_parse_errors=False, nr_procs=2):
         """Initialises Nfdump2Parquet instance.
 
         Provide nfdump_fields parameter **only** if defaults don't work
@@ -86,21 +120,48 @@ class Pcap2Parquet:
             self.dst_dir = f"{self.dst_dir}/"
         self.parse_errors = 0
         self.log_parse_errors = log_parse_errors
+        self.nr_procs = int(nr_procs)
+
+        letters = string.ascii_lowercase
+        self.random = ''.join(random.choice(letters) for i in range(10))
+        self.splitsize = 100
+        # MB
 
     # ------------------------------------------------------------------------------
     def __prepare_file(self):
 
         # Chop up a file into multiple chunks if it is bigger than a certain size
         # Returns either a list of chunk files or the same single file
+
+        use_tmp = False
         filename = Path(self.src_file)
-        if filename.stat().st_size < (100*1000*1000):  # PCAP is smaller than 100MB
+        if filename.stat().st_size < (self.splitsize*1000*1000):  # PCAP is smaller than 100MB
             self.chunks = [self.src_file]
         else:
-            logger.debug(f'Splitting PCAP file {filename} into chunks of 100MB.')
-            subprocess.run(['tcpdump', '-r', filename, '-w', '/tmp/pcap2parquet_chunk', '-C', '100'],
-                           capture_output=True)
-            self.chunks = sorted([Path(rootdir) / file for rootdir, _, files in os.walk('/tmp')
-                                  for file in files if file.startswith('pcap2parquet_chunk')])
+            # Now check if the file ends in .pcap
+            # If not: tcpdump on Ubuntu variants will return permission denied
+            # when splitting into multiple chunks
+            # Solution: copy to tmp folder with extension .pcap...
+            if not self.src_file.endswith('.pcap'):
+                logger.debug(f'Copy/rename file since it does not end in .pcap')
+                shutil.copyfile(self.src_file, f'/tmp/{self.random}.pcap')
+                filename = Path(f'/tmp/{self.random}.pcap')
+                use_tmp = True
+            logger.debug(f'Splitting PCAP file {filename} into chunks of {self.splitsize}MB.')
+            process = subprocess.run(
+                ['tcpdump', '-r', filename, '-w', f'/tmp/pcap2parquet_{self.random}_chunk', '-C', f'{self.splitsize}'],
+                stderr=subprocess.PIPE)
+            output = process.stderr
+            if process.returncode != 0:
+                err = output.decode('utf-8').strip()
+                logger.error(f'splitting file failed: {err}')
+            else:
+                self.chunks = [Path(rootdir) / file for rootdir, _, files in os.walk('/tmp')
+                               for file in files if file.startswith(f'pcap2parquet_{self.random}_chunk')]
+                logger.debug(f"Split into {len(self.chunks)} chunks")
+
+            if use_tmp:
+                os.remove(filename)
 
     # ------------------------------------------------------------------------------
     def __cleanup(self):
@@ -109,6 +170,12 @@ class Pcap2Parquet:
                 for chunk in self.chunks:
                     os.remove(chunk)
             self.chunks = None
+
+        if self.chunks_csv:
+            if len(self.chunks_csv) > 1:
+                for chunk in self.chunks_csv:
+                    os.remove(chunk)
+            self.chunks_csv = None
 
     # ------------------------------------------------------------------------------
     def __parse_error(self, row):
@@ -119,6 +186,51 @@ class Pcap2Parquet:
             with open(self.basename+'-parse-errors.txt', 'a', encoding='utf-8') as f:
                 f.write(row.text+'\n')
         return 'skip'
+
+    # ------------------------------------------------------------------------------
+    def convert_chunk_to_csv(self, pcap_chunk):
+        # Create the list of columns tshark has to export to CSV
+        col_extract = list(self.PCAP_COLUMN_NAMES.keys())
+
+        new_env = dict(os.environ)
+        new_env['LC_ALL'] = 'C.utf8'
+        new_env['LC_TIME'] = 'POSIX'
+        new_env['LC_NUMERIC'] = 'C.utf8'
+
+        tmp_file, tmp_filename = tempfile.mkstemp()
+        # tshark_error = False
+        # Create command
+        csv_file = None
+        command = ['tshark', '-r', str(pcap_chunk), '-t', 'ud', '-T', 'fields']
+        for field in col_extract:
+            command.extend(['-e', field])
+        for option in ['header=n', 'separator=/t', 'quote=n', 'occurrence=f']:
+            command.extend(['-E', option])
+
+        logger.debug(" ".join(command))
+        try:
+            process = subprocess.run(command, stdout=tmp_file, stderr=subprocess.PIPE, env=new_env)
+            output = process.stderr
+            if process.returncode != 0:
+                err = output.decode('utf-8')
+                logger.error(f'tshark command failed:{err}')
+                os.close(tmp_file)
+                os.remove(tmp_filename)
+            else:
+                if len(output) > 0:
+                    err = output.decode('utf-8')
+                    for errline in err.split('\n'):
+                        if len(errline) > 0:
+                            logger.warning(errline)
+                os.close(tmp_file)
+                csv_file = tmp_filename
+        except Exception as e:
+            logger.error(f'Error reading {str(pcap_chunk)} : {e}')
+            pp.pprint(e)
+            os.close(tmp_file)
+            os.remove(tmp_filename)
+
+        return csv_file
 
     # ------------------------------------------------------------------------------
     def convert(self):
@@ -139,104 +251,78 @@ class Pcap2Parquet:
 
         start = time.time()
 
+        # Split source pcap into chunks if need be
         self.__prepare_file()
+        if not self.chunks:
+            logger.error("conversion aborted")
+            return None
 
-        tmp_file, tmp_filename = tempfile.mkstemp()
-        os.close(tmp_file)
+        # Convert chunks to csv individually and in parallel
+        pool = multiprocessing.Pool(self.nr_procs)
+        results = pool.map(self.convert_chunk_to_csv, self.chunks)  # Convert the PCAP chunks concurrently
+        pool.close()
+        pool.join()
 
-        tshark_error = False
-        try:
-            with open(tmp_filename, 'a', encoding='utf-8') as f:
-                new_env = dict(os.environ)
-                new_env['LC_ALL'] = 'C.utf8'
-                new_env['LC_TIME'] = 'POSIX'
-                new_env['LC_NUMERIC'] = 'C.utf8'
-                for chunk in self.chunks:
-
-                    # Create command
-                    command = ['tshark', '-r', str(chunk), '-t', 'ud', '-T', 'fields']
-                    for field in col_extract:
-                        command.extend(['-e', field])
-                    for option in ['header=n', 'separator=/t', 'quote=n', 'occurrence=f']:
-                        command.extend(['-E', option])
-
-                    logger.debug(" ".join(command))
-                    process = subprocess.run(command, stdout=f, stderr=subprocess.PIPE, env=new_env)
-                    output = process.stderr
-                    if process.returncode != 0:
-                        err = output.decode('utf-8')
-                        logger.error(f'tshark command failed:{err}\n')
-                        tshark_error = True
-                    else:
-                        if len(output) > 0:
-                            err = output.decode('utf-8')
-                            for errline in err.split('\n'):
-                                if len(errline) > 0:
-                                    logger.warning(errline)
-
-        except Exception as e:
-            logger.error(f'Error reading {self.src_file} : {e}')
-            pp.pprint(e)
-            self.__cleanup()
-            return
+        self.chunks_csv = []
+        for result in results:
+            if result:
+                self.chunks_csv.append(result)
 
         duration = time.time() - start
         sf = os.path.basename(self.src_file)
         logger.debug(f"{sf} to CSV in {duration:.2f}s")
-
-        self.__cleanup()
-
-        # If an error occurred: clean up and return
-        if tshark_error:
-            os.remove(tmp_filename)
-            self.__cleanup()
-            return
+        start = time.time()
 
         pqwriter = None
 
-        # Now read the produced CSV
-        try:
-            with pyarrow.csv.open_csv(
-                                      input_file=tmp_filename,
-                                      # input_file='tmp.csv',
-                                      read_options=pyarrow.csv.ReadOptions(
-                                          block_size=self.block_size,
-                                          column_names=col_names,
-                                          encoding='utf-8',
-                                      ),
-                                      parse_options=pyarrow.csv.ParseOptions(
-                                          delimiter='\t',
-                                          # quote_char="'",
-                                          invalid_row_handler=self.__parse_error
-                                      ),
-                                      convert_options=pyarrow.csv.ConvertOptions(
-                                          timestamp_parsers=[pyarrow.csv.ISO8601],
-                                          column_types=col_type,
-                                      ),
-                                      ) as reader:
-                chunk_nr = 0
-                for next_chunk in reader:
-                    chunk_nr += 1
-                    if next_chunk is None:
-                        break
-                    table = pa.Table.from_batches([next_chunk])
-                    # Add a column with the basename of the source file
-                    # This will allow detailed investigation of the proper
-                    # original pcap file with tshark if needed
-                    table = table.append_column('pcap_file', pa.array([self.basename] * len(table), pa.string()))
+        # Now read the produced CSVs and convert them to parquet one by one
+        for chunknr, chunkcsv in enumerate(self.chunks_csv):
+            logger.debug(f"Writing to parquet: {chunknr+1}/{len(self.chunks_csv)}")
+            try:
+                with open(chunkcsv, "rb") as f:
+                    f = UnicodeErrorIgnorerIO(f)
+                    with pyarrow.csv.open_csv(
+                                              input_file=f,
+                                              # input_file='tmp.csv',
+                                              read_options=pyarrow.csv.ReadOptions(
+                                                  block_size=self.block_size,
+                                                  column_names=col_names,
+                                                  encoding='utf-8',
+                                              ),
+                                              parse_options=pyarrow.csv.ParseOptions(
+                                                  delimiter='\t',
+                                                  # quote_char="'",
+                                                  invalid_row_handler=self.__parse_error
+                                              ),
+                                              convert_options=pyarrow.csv.ConvertOptions(
+                                                  timestamp_parsers=[pyarrow.csv.ISO8601],
+                                                  column_types=col_type,
+                                              ),
+                                              ) as reader:
+                        for next_chunk in reader:
+                            if next_chunk is None:
+                                break
+                            table = pa.Table.from_batches([next_chunk])
+                            # Add a column with the basename of the source file
+                            # This will allow detailed investigation of the proper
+                            # original pcap file with tshark if needed
+                            table = table.append_column('pcap_file', pa.array([self.basename] * len(table), pa.string()))
 
-                    if not pqwriter:
-                        pqwriter = pq.ParquetWriter(f'{self.dst_dir}{self.basename}.parquet', table.schema)
+                            if not pqwriter:
+                                pqwriter = pq.ParquetWriter(f'{self.dst_dir}{self.basename}.parquet', table.schema)
 
-                    pqwriter.write_table(table)
+                            pqwriter.write_table(table)
 
-        except pyarrow.lib.ArrowInvalid as e:
-            logger.error(e)
+            except pyarrow.lib.ArrowInvalid as e:
+                logger.error(e)
 
-        duration = time.time() - start
-        logger.debug(f"CSV to Parquet in {duration:.2f}s")
+        if pqwriter:
+            pqwriter.close()
+            duration = time.time() - start
+            logger.debug(f"CSV to Parquet in {duration:.2f}s")
 
-        os.remove(tmp_filename)
+        self.__cleanup()
+        return True
 
 
 ###############################################################################
@@ -346,6 +432,13 @@ def parser_add_arguments():
                         help="recursively searches for pcap files if source specifies a directory.",
                         action="store_true")
 
+    parser.add_argument("-n",
+                        help="Number of processes in parallel to convert.\n"\
+                        f"Default is the number of cores divided by two",
+                        action="store",
+                        default=0,
+                        type=int)
+
     parser.add_argument("--debug",
                         help="show debug output",
                         action="store_true")
@@ -397,11 +490,23 @@ def main():
     filelist = sorted(filelist)
     # pp.pprint(filelist)
 
+    nr_of_processes = args.n
+    if nr_of_processes == 0:
+        nr_of_processes = 2
+        if os.cpu_count():
+            nr_of_processes = int(os.cpu_count()/2)
+
+    logger.info(f"Using up to {nr_of_processes} cores for conversion")
+
     for filename in filelist:
         logger.info(f'converting {filename}')
         try:
-            pcap2pqt = Pcap2Parquet(filename, args.parquetdir, args.log_parse_errors)
-            pcap2pqt.convert()
+            start = time.time()
+            pcap2pqt = Pcap2Parquet(filename, args.parquetdir, args.log_parse_errors, nr_of_processes)
+            ret = pcap2pqt.convert()
+            duration = int(time.time() - start)
+            if ret:
+                logger.info(f"conversion took {duration} seconds")
             if pcap2pqt.parse_errors > 0:
                 logger.info(f'{pcap2pqt.parse_errors} parse errors during conversion, these lines were skipped')
         except FileNotFoundError as fnf:
