@@ -9,9 +9,11 @@ If you are fairly comfortable using SQL, then you can use [duckdb](https://duckd
 See below for an example.
 
 ## requirements
-You need to have tshark installed (and on the path) as it is called by pcap2parquet:
-[https://tshark.dev/](https://tshark.dev/)
+You need to have [tshark](https://tshark.dev/) and tcpdump installed (and on the path) as both are called by pcap2parquet.
 
+They are invoked without `sudo`, so make sure both can be executed by your user account. 
+tcpdump is used to split bigger pcap files into smaller chunks before processing, it does not need access to network interfaces.
+(simply do a `tcpdump -r <pcap file>` to check permissions are set properly)
 ## Usage
 
 ```commandline
