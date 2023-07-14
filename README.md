@@ -12,8 +12,11 @@ See below for an example.
 You need to have [tshark](https://tshark.dev/) and tcpdump installed (and on the path) as both are called by pcap2parquet.
 
 They are invoked without `sudo`, so make sure both can be executed by your user account. 
+
 tcpdump is used to split bigger pcap files into smaller chunks before processing, it does not need access to network interfaces.
-(simply do a `tcpdump -r <pcap file>` to check permissions are set properly)
+(simply do a `tcpdump -r <pcap file>` to check permissions are set properly).
+
+tshark is used to export the pcap file to an intermediate CSV file which is then converted to the final parquet file.
 ## Usage
 
 ```commandline
@@ -46,6 +49,9 @@ Resulting parquet files are stored in the parquetdir (destination directory) wit
 
 If the source points to a directory then all pcap files in that directory will be converted to parquet files and stored in the destination directory.
 
+Pcap files up to tens of megabytes are converted in a matter of seconds. Larger files of a few hundred megabytes take more time. Files over a gigabyte in size can take minutes to tens of minutes.
+
+To speed up conversion, files larger than 100MB are first split into chunks of 100MB, then converted in parallel to the intermediate (CSV) format. The number of cores used is by default half of the numbers of cores present in the system. Note that a cpu with hyperthreading effectively doubles the number of cores. You can use the -n argument to specify more or fewer cores to be used than the default.
 
 ## Using duckdb
 
