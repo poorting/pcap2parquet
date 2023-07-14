@@ -82,6 +82,7 @@ class Pcap2Parquet:
         'http.host': {'http_host': pa.string()},
         'http.request.method': {'http_request_method': pa.string()},
         'http.user_agent': {'http_user_agent': pa.string()},
+        'http.file_data': {'http_file_data': pa.string()},
         'icmp.type': {'icmp_type': pa.uint8()},
         'ip.frag_offset': {'ip_frag_offset': pa.uint16()},
         'ip.ttl': {'ip_ttl': pa.uint8()},
