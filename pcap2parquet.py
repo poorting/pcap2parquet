@@ -62,8 +62,8 @@ class UnicodeErrorIgnorerIO(io.IOBase):
 
 
 ###############################################################################
-class Pcap2Parquet:
 
+class Pcap2Parquet:
     PCAP_COLUMN_NAMES: dict[str, dict] = {
         '_ws.col.Time': {'frame_time': pa.timestamp('us')},
         'ip.src': {'ip_src': pa.string()},
@@ -136,7 +136,7 @@ class Pcap2Parquet:
 
         use_tmp = False
         filename = Path(self.src_file)
-        if filename.stat().st_size < (self.splitsize*1000*1000):  # PCAP is smaller than 100MB
+        if filename.stat().st_size < (self.splitsize * 1000 * 1000):  # PCAP is smaller than 100MB
             self.chunks = [self.src_file]
         else:
             # Now check if the file ends in .pcap
@@ -184,8 +184,8 @@ class Pcap2Parquet:
         self.parse_errors += 1
         if self.log_parse_errors:
             # Append to file
-            with open(self.basename+'-parse-errors.txt', 'a', encoding='utf-8') as f:
-                f.write(row.text+'\n')
+            with open(self.basename + '-parse-errors.txt', 'a', encoding='utf-8') as f:
+                f.write(row.text + '\n')
         return 'skip'
 
     # ------------------------------------------------------------------------------
@@ -278,28 +278,28 @@ class Pcap2Parquet:
 
         # Now read the produced CSVs and convert them to parquet one by one
         for chunknr, chunkcsv in enumerate(self.chunks_csv):
-            logger.debug(f"Writing to parquet: {chunknr+1}/{len(self.chunks_csv)}")
+            logger.debug(f"Writing to parquet: {chunknr + 1}/{len(self.chunks_csv)}")
             try:
                 with open(chunkcsv, "rb") as f:
                     f = UnicodeErrorIgnorerIO(f)
                     with pyarrow.csv.open_csv(
-                                              input_file=f,
-                                              # input_file='tmp.csv',
-                                              read_options=pyarrow.csv.ReadOptions(
-                                                  block_size=self.block_size,
-                                                  column_names=col_names,
-                                                  encoding='utf-8',
-                                              ),
-                                              parse_options=pyarrow.csv.ParseOptions(
-                                                  delimiter='\t',
-                                                  # quote_char="'",
-                                                  invalid_row_handler=self.__parse_error
-                                              ),
-                                              convert_options=pyarrow.csv.ConvertOptions(
-                                                  timestamp_parsers=[pyarrow.csv.ISO8601],
-                                                  column_types=col_type,
-                                              ),
-                                              ) as reader:
+                            input_file=f,
+                            # input_file='tmp.csv',
+                            read_options=pyarrow.csv.ReadOptions(
+                                block_size=self.block_size,
+                                column_names=col_names,
+                                encoding='utf-8',
+                            ),
+                            parse_options=pyarrow.csv.ParseOptions(
+                                delimiter='\t',
+                                # quote_char="'",
+                                invalid_row_handler=self.__parse_error
+                            ),
+                            convert_options=pyarrow.csv.ConvertOptions(
+                                timestamp_parsers=[pyarrow.csv.ISO8601],
+                                column_types=col_type,
+                            ),
+                    ) as reader:
                         for next_chunk in reader:
                             if next_chunk is None:
                                 break
@@ -307,7 +307,8 @@ class Pcap2Parquet:
                             # Add a column with the basename of the source file
                             # This will allow detailed investigation of the proper
                             # original pcap file with tshark if needed
-                            table = table.append_column('pcap_file', pa.array([self.basename] * len(table), pa.string()))
+                            table = table.append_column('pcap_file',
+                                                        pa.array([self.basename] * len(table), pa.string()))
 
                             if not pqwriter:
                                 pqwriter = pq.ParquetWriter(f'{self.dst_dir}{self.basename}.parquet', table.schema)
@@ -433,9 +434,13 @@ def parser_add_arguments():
                         help="recursively searches for pcap files if source specifies a directory.",
                         action="store_true")
 
+    parser.add_argument("-i", "--ignore-name",
+                        help="Assume all files are PCAPs (rather than just snort.log* or *.pcap)",
+                        action="store_true")
+
     parser.add_argument("-n",
-                        help="Number of processes in parallel to convert.\n"\
-                        f"Default is the number of cores divided by two",
+                        help="Number of processes in parallel to convert.\n" \
+                             f"Default is the number of cores divided by two",
                         action="store",
                         default=0,
                         type=int)
@@ -453,7 +458,7 @@ def parser_add_arguments():
 
 
 # ------------------------------------------------------------------------------
-def list_files(directory, recursive=False):
+def list_files(directory, recursive=False, ignore_pattern=False):
     filelist = []
     if not os.path.isdir(directory):
         return filelist
@@ -464,10 +469,13 @@ def list_files(directory, recursive=False):
         for entry in it:
             if not entry.name.startswith('.'):
                 if entry.is_file():
-                    if re.match(pattern, entry.name):
+                    if ignore_pattern:
                         filelist.append('{0}{1}'.format(directory, entry.name))
+                    else:
+                        if re.match(pattern, entry.name):
+                            filelist.append('{0}{1}'.format(directory, entry.name))
                 elif recursive:
-                    filelist.extend(list_files(directory + entry.name, recursive))
+                    filelist.extend(list_files(directory + entry.name, recursive, ignore_pattern))
 
     return filelist
 
@@ -484,7 +492,7 @@ def main():
     filename = args.source
 
     if os.path.isdir(filename):
-        filelist = list_files(filename, args.recursive)
+        filelist = list_files(filename, args.recursive, args.ignore_name)
     else:
         filelist.append(filename)
 
@@ -495,7 +503,11 @@ def main():
     if nr_of_processes == 0:
         nr_of_processes = 2
         if os.cpu_count():
-            nr_of_processes = int(os.cpu_count()/2)
+            nr_of_processes = int(os.cpu_count() / 2)
+
+    if len(filelist) == 0:
+        logger.info("No pcaps found to convert")
+        exit(0)
 
     logger.info(f"Using up to {nr_of_processes} cores for conversion")
 
