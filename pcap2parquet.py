@@ -97,6 +97,8 @@ class Pcap2Parquet:
     # Max size of chunk to read at a time
     block_size = 512 * 1024 * 1024
 
+    # Max size of pcap to read in one go (in MB)
+    max_pcap_chunk = 25
     chunks = None
     chunks_csv = None
 
@@ -125,8 +127,17 @@ class Pcap2Parquet:
 
         letters = string.ascii_lowercase
         self.random = ''.join(random.choice(letters) for i in range(10))
-        self.splitsize = 100
-        # MB
+
+        # Determine splitsize bases on filesize, max pcap size and nr of cores to use.
+        # Split files even if smaller than max pcap size to make maximum use of parallel
+        # processing. If filesize > nr_procs*maxpcapchunk then just use that.
+        filesize = round(os.path.getsize(self.src_file)/(1024*1024))
+        logger.debug(f"Filesize is approximately {filesize}MB")
+
+        self.splitsize = self.max_pcap_chunk
+        if (nr_procs * self.max_pcap_chunk) > filesize > nr_procs:
+            self.splitsize = int((filesize/nr_procs)+1)
+            logger.debug(f"Split size set to {self.splitsize}MB")
 
     # ------------------------------------------------------------------------------
     def __prepare_file(self):
