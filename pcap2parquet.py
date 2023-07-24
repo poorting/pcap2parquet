@@ -95,10 +95,10 @@ class Pcap2Parquet:
     }
 
     # Max size of chunk to read at a time
-    block_size = 512 * 1024 * 1024
+    block_size = 64 * 1024 * 1024
 
     # Max size of pcap to read in one go (in MB)
-    max_pcap_chunk = 25
+    max_pcap_chunk = 200
     chunks = None
     chunks_csv = None
 
@@ -147,36 +147,34 @@ class Pcap2Parquet:
 
         use_tmp = False
         filename = Path(self.src_file)
-        if filename.stat().st_size < (self.splitsize * 1000 * 1000):  # PCAP is smaller than 100MB
-            self.chunks = [self.src_file]
+        # Check if the file ends in .pcap
+        # If not: tcpdump on Ubuntu variants may return permission denied
+        # when splitting into multiple chunks
+        # Solution: copy to tmp folder with extension .pcap...
+        if not self.src_file.endswith('.pcap'):
+            logger.debug(f'Copy/rename file since it does not end in .pcap')
+            shutil.copyfile(self.src_file, f'/tmp/{self.random}.pcap')
+            filename = Path(f'/tmp/{self.random}.pcap')
+            use_tmp = True
+        logger.debug(f'Splitting PCAP file {filename} into chunks of {self.splitsize}MB.')
+        process = subprocess.run(
+            ['tcpdump', '-r', filename, '-w', f'/tmp/pcap2parquet_{self.random}_chunk-', '-C', f'{self.splitsize}'],
+            stderr=subprocess.PIPE)
+        output = process.stderr
+        if process.returncode != 0:
+            err = output.decode('utf-8').strip()
+            logger.error(f'splitting file failed: {err}')
         else:
-            # Now check if the file ends in .pcap
-            # If not: tcpdump on Ubuntu variants will return permission denied
-            # when splitting into multiple chunks
-            # Solution: copy to tmp folder with extension .pcap...
-            if not self.src_file.endswith('.pcap'):
-                logger.debug(f'Copy/rename file since it does not end in .pcap')
-                shutil.copyfile(self.src_file, f'/tmp/{self.random}.pcap')
-                filename = Path(f'/tmp/{self.random}.pcap')
-                use_tmp = True
-            logger.debug(f'Splitting PCAP file {filename} into chunks of {self.splitsize}MB.')
-            process = subprocess.run(
-                ['tcpdump', '-r', filename, '-w', f'/tmp/pcap2parquet_{self.random}_chunk-', '-C', f'{self.splitsize}'],
-                stderr=subprocess.PIPE)
-            output = process.stderr
-            if process.returncode != 0:
-                err = output.decode('utf-8').strip()
-                logger.error(f'splitting file failed: {err}')
-            else:
-                self.chunks = [Path(rootdir) / file for rootdir, _, files in os.walk('/tmp')
-                               for file in files if file.startswith(f'pcap2parquet_{self.random}_chunk-')]
-                logger.debug(f"Split into {len(self.chunks)} chunks")
+            self.chunks = [Path(rootdir) / file for rootdir, _, files in os.walk('/tmp')
+                           for file in files if file.startswith(f'pcap2parquet_{self.random}_chunk-')]
+            logger.debug(f"Split into {len(self.chunks)} chunks")
 
-            if use_tmp:
-                os.remove(filename)
+        if use_tmp:
+            os.remove(filename)
 
     # ------------------------------------------------------------------------------
     def __cleanup(self):
+
         if self.chunks:
             if len(self.chunks) > 1:
                 for chunk in self.chunks:
@@ -209,7 +207,7 @@ class Pcap2Parquet:
         new_env['LC_TIME'] = 'POSIX'
         new_env['LC_NUMERIC'] = 'C.utf8'
 
-        tmp_file, tmp_filename = tempfile.mkstemp()
+        # tmp_file, tmp_filename = tempfile.mkstemp()
         # tshark_error = False
         # Create command
         csv_file = None
@@ -290,13 +288,15 @@ class Pcap2Parquet:
         duration = time.time() - start
         sf = os.path.basename(self.src_file)
         logger.debug(f"{sf} to CSV in {duration:.2f}s")
+
         start = time.time()
-
         pqwriter = None
-
         self.chunks_csv = sorted(self.chunks_csv)
         # Now read the produced CSVs and convert them to parquet one by one
         for chunknr, chunkcsv in enumerate(self.chunks_csv):
+            filename = Path(chunkcsv)
+            size = round(filename.stat().st_size/(1024*1024),2)
+            # logger.debug(f"CSV file size: {size}MB")
             logger.debug(f"Writing to parquet: {chunknr + 1}/{len(self.chunks_csv)}")
             try:
                 with open(chunkcsv, "rb") as f:
