@@ -161,7 +161,7 @@ class Pcap2Parquet:
                 use_tmp = True
             logger.debug(f'Splitting PCAP file {filename} into chunks of {self.splitsize}MB.')
             process = subprocess.run(
-                ['tcpdump', '-r', filename, '-w', f'/tmp/pcap2parquet_{self.random}_chunk', '-C', f'{self.splitsize}'],
+                ['tcpdump', '-r', filename, '-w', f'/tmp/pcap2parquet_{self.random}_chunk-', '-C', f'{self.splitsize}'],
                 stderr=subprocess.PIPE)
             output = process.stderr
             if process.returncode != 0:
@@ -169,7 +169,7 @@ class Pcap2Parquet:
                 logger.error(f'splitting file failed: {err}')
             else:
                 self.chunks = [Path(rootdir) / file for rootdir, _, files in os.walk('/tmp')
-                               for file in files if file.startswith(f'pcap2parquet_{self.random}_chunk')]
+                               for file in files if file.startswith(f'pcap2parquet_{self.random}_chunk-')]
                 logger.debug(f"Split into {len(self.chunks)} chunks")
 
             if use_tmp:
@@ -221,24 +221,31 @@ class Pcap2Parquet:
 
         logger.debug(" ".join(command))
         try:
-            process = subprocess.run(command, stdout=tmp_file, stderr=subprocess.PIPE, env=new_env)
-            output = process.stderr
-            if process.returncode != 0:
-                err = output.decode('utf-8')
-                logger.error(f'tshark command failed:{err}')
-                os.close(tmp_file)
-                os.remove(tmp_filename)
-            else:
-                if len(output) > 0:
+            chunk_nr = str(pcap_chunk).split('-')[-1]
+            if chunk_nr == '':
+                chunk_nr = '0'
+            chunk_nr = int(chunk_nr)
+            # Create chunks that start with an integer number with leading zeroes
+            # So that parquet file can be written out in time series order.
+            tmp_filename = f'/tmp/{chunk_nr:06d}-{self.random}.csv'
+            with open(tmp_filename, 'w') as tmp_file:
+                process = subprocess.run(command, stdout=tmp_file, stderr=subprocess.PIPE, env=new_env)
+                output = process.stderr
+                if process.returncode != 0:
                     err = output.decode('utf-8')
-                    for errline in err.split('\n'):
-                        if len(errline) > 0:
-                            logger.warning(errline)
-                os.close(tmp_file)
-                csv_file = tmp_filename
+                    logger.error(f'tshark command failed:{err}')
+                    os.close(tmp_file)
+                    os.remove(tmp_filename)
+                else:
+                    if len(output) > 0:
+                        err = output.decode('utf-8')
+                        for errline in err.split('\n'):
+                            if len(errline) > 0:
+                                logger.warning(errline)
+                    # os.close(tmp_file)
+                    csv_file = tmp_filename
         except Exception as e:
             logger.error(f'Error reading {str(pcap_chunk)} : {e}')
-            pp.pprint(e)
             os.close(tmp_file)
             os.remove(tmp_filename)
 
@@ -287,6 +294,7 @@ class Pcap2Parquet:
 
         pqwriter = None
 
+        self.chunks_csv = sorted(self.chunks_csv)
         # Now read the produced CSVs and convert them to parquet one by one
         for chunknr, chunkcsv in enumerate(self.chunks_csv):
             logger.debug(f"Writing to parquet: {chunknr + 1}/{len(self.chunks_csv)}")
