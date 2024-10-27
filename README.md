@@ -1,6 +1,8 @@
 # pcap2parquet
 Create parquet files from network packet captures (pcap files).
 
+This tool uses Python, tcpdump and tshark and converting large pcaps can take some time. If you want (way) faster conversions, please take a look at the Rust version I made: [pcap-converter](https://github.com/NLADC/pcap-converter). Which is between 5 to 16 times faster. 
+
 ### Why?
 Analysing pcaps can be tricky, especially if you are not used to working with the tools that are frequently used for analysing pcaps (wireshark, tshark, ...).
 
